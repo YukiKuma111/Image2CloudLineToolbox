@@ -42,7 +42,8 @@ class ImageCreator():
                     image_name = timestr + ".png"    #图像命名：时间戳.png
 
                     if count % int(args.rate) == 0:
-                        cv2.imwrite(args.save_path + image_name, undistorted_image)  #保存；
+                        # cv2.imwrite(args.save_path + image_name, undistorted_image)  #保存；
+                        cv2.imwrite(args.save_path + image_name, cv_image)  #保存；
                         count = 1
                         print("Save ", image_name)
                     else:
@@ -74,8 +75,8 @@ class ImageCreator():
         undistorted_image = cv2.remap(image, map1, map2, cv2.INTER_LINEAR)
 
         # Optionally crop the image (roi[0:2] = top-left corner, roi[2:4] = width and height)
-        x, y, w, h = roi
-        undistorted_image = undistorted_image[y:y + h, x:x + w]
+        # x, y, w, h = roi
+        # undistorted_image = undistorted_image[y:y + h, x:x + w]
 
         return undistorted_image
 

@@ -52,16 +52,18 @@ class Pixel2PointCloud:
             help="Saving path to the output point cloud data",
         )
 
+        # 获取用户输入
         args = parser.parse_args()
         self.panorama_pcd = args.panoramapointcloud
         self.bag_file = args.rosbag
         self.json_path = args.json
         self.save_path = args.save
+
         # 读取intrinsic.txt 和 extrinsic.txt
         self.intrinsic_file = os.path.join(args.parameter, "intrinsic.txt")
         self.extrinsic_file = os.path.join(args.parameter, "extrinsic.txt")
 
-        # 检查点云文件夹是否存在
+        # 检查文件是否存在
         if not os.path.exists(self.panorama_pcd):
             print(f"Error: The folder {self.panorama_pcd} does not exist.")
             return
@@ -80,20 +82,30 @@ class Pixel2PointCloud:
         self.target_frame = "body"
         self.source_frame = "camera_init"
 
-        self.get_parameters()
-        rvec, _ = cv2.Rodrigues(self.R_mat)
-
-        # 获取并排序文件夹中的 PCD 文件
-        # self.pcd_filelist = self.get_sorted_pcd()
-
+        # 获取数据
         pixel_data = self.load_json_data()
         tf_data = self.parse_tf_from_bag()
         panorama_pcd = o3d.io.read_point_cloud(self.panorama_pcd)
         projection_pcd = o3d.io.read_point_cloud(self.panorama_pcd)
         lines_pcd = o3d.geometry.PointCloud()
 
-        # for img_tsp, img_data in pixel_data.items():
+        # 获取参数
+        self.get_parameters()
+        rvec, _ = cv2.Rodrigues(self.R_mat)
+
+        # 获取并排序文件夹中的 PCD 文件
+        # self.pcd_filelist = self.get_sorted_pcd()
+
         for img_tsp, data in pixel_data.items():
+            # 定义并初始化变量
+            roi_pcd = o3d.geometry.PointCloud()
+            projection_dict = {}  # 3D 投影 2D 的关联字典
+            start_end_points_list = []  # 只有和pixel一一对应的起点，中间的点，和终点
+            start2end_points_list = []  # 按照一定密度生成的点
+            lines_points_in_world = []  # 转置到世界坐标系下的dot lines points
+            lines_panorama_pcd = o3d.geometry.PointCloud()
+
+            # 查找与图像时间戳最接近的tf时间戳
             tf_tsp_list = list(tf_data.keys())
             tf_tsp = self.closest_tsp(img_tsp, tf_tsp_list)
             print(f"IMG Timestamp:\t{img_tsp}.png")
@@ -101,7 +113,8 @@ class Pixel2PointCloud:
 
             # 找到对应时间戳的 translation 和 rotation_matrix
             translation = tf_data[tf_tsp]["translation"]
-            rotation_matrix = np.linalg.inv(tf_data[tf_tsp]["rotation_matrix"])
+            rotation_matrix = tf_data[tf_tsp]["rotation_matrix"]
+            inv_rotation_matrix = np.linalg.inv(rotation_matrix)
 
             # 计算欧拉角（需要yaw对后续找到的地面点做筛查？）
             # r = R.from_matrix(rotation_matrix)
@@ -119,15 +132,14 @@ class Pixel2PointCloud:
                 translation[2] + 10,
             )
 
-            # 将 points 转换为 open3d.geometry.PointCloud 对象
-            roi_pcd = o3d.geometry.PointCloud()
+            # 将 roi_points 转换为 open3d.geometry.PointCloud 对象
             roi_pcd.points = o3d.utility.Vector3dVector(np.array(roi_points))
             # o3d.io.write_point_cloud(img_tsp + "cliped.pcd", roi_pcd)  # for debug
 
             # 对点云进行旋转和平移操作
             points = np.asarray(roi_pcd.points)
             transformed_points = points - translation  # 平移
-            rotated_points = np.dot(transformed_points, rotation_matrix.T)  # 旋转
+            rotated_points = np.dot(transformed_points, inv_rotation_matrix.T)  # 旋转
             projection_pcd.points = o3d.utility.Vector3dVector(rotated_points)
             # o3d.io.write_point_cloud(
             #     img_tsp + "transformed_point_cloud.pcd", projection_pcd
@@ -135,7 +147,7 @@ class Pixel2PointCloud:
 
             # 筛选投影点云（一般来说要配合相机FOV，这里先直接hardcode）
             filtered_pts = self.filter_point_cloud(
-                projection_pcd, -1, 10, -2, 2, -10, -0.1
+                projection_pcd, -1, 10, -2, 2, -10, -0.4
             )
 
             # 投影3D点到2D图像视图
@@ -147,17 +159,16 @@ class Pixel2PointCloud:
                 self.distortion_coeffs,
             )
 
-            # 构建字典，关联 2D 投影点和 3D 点云坐标
-            projection_dict = {}
+            # 用字典关联 2D 投影点和 3D 点云坐标
             for i, point_3d in enumerate(filtered_pts):
                 point_2d = tuple(projected_pts[i][0])  # 投影后的2D坐标
                 projection_dict[point_2d] = point_3d
 
-            start_end_points_list = []  # 只有和pixel一一对应的起点，中间的点，和终点
-            start2end_points_list = []  # 按照一定密度生成的点
             # 打印对应的线段数据并保存最近的3D点
             for i, line in enumerate(data["lines"], 1):
                 line_3d_points = []
+                lines_pts = []
+                # 遍历每一个像素点，并通过计算距离其最近的2D投影点来查询到对应的3D点云坐标
                 for pxl in line:
                     print(f"  pixel {i}: {pxl}")
                     nearest_3d_point = self.find_nearest_2d_point(
@@ -167,9 +178,7 @@ class Pixel2PointCloud:
                         f"  Nearest 3D point: [{nearest_3d_point[0]:.2f}, {nearest_3d_point[1]:.2f}, {nearest_3d_point[2]:.2f}]"
                     )
 
-                    # 将 nearest_3d_point 加入 pixel_data
                     line_3d_points.append(nearest_3d_point)
-
                 start_end_points_list.append(line_3d_points)
                 # 将每个线段的对应 3D 点保存到 "points" 列表中
                 pixel_data[img_tsp]["points"] = start_end_points_list
@@ -177,19 +186,34 @@ class Pixel2PointCloud:
                 # 生成等间隔的三维点
                 start2end_points_list = self.generate_dot_lines(line_3d_points)
 
-                # 扁平化 start_end_points_list，将所有 3D 点提取出来
+                # 扁平化 start2end_points_list，将所有 3D 点提取出来
                 flat_line_3d_points = [
                     point for line in start2end_points_list for point in line
                 ]
 
-                # 将这些新的 3D 点追加到 filtered_pts 中
-                filtered_pts.extend(flat_line_3d_points)
+                # 将这些新的 3D 点追加到 lines_pts 中，并转换到世界坐标系下
+                lines_pts.extend(flat_line_3d_points)
+                transformed_lines_pts = self.apply_transformation(
+                    lines_pts, rotation_matrix, translation
+                )
 
-            filtered_pcd = o3d.geometry.PointCloud()
-            filtered_pcd.points = o3d.utility.Vector3dVector(np.array(filtered_pts))
-            o3d.io.write_point_cloud(
-                img_tsp + "filtered_pcdwpoints.pcd", filtered_pcd
-            )  # for debug
+                # 追加 dot lines， 用于后续保存
+                lines_points_in_world.extend(transformed_lines_pts)
+            lines_panorama_pcd.points = o3d.utility.Vector3dVector(
+                np.array(lines_points_in_world)
+            )
+
+            # 将新的点云数据与原点云数据合并
+            panorama_pcd.points.extend(lines_panorama_pcd.points)
+            lines_pcd.points.extend(lines_panorama_pcd.points)
+
+        # 保存点云结果
+        o3d.io.write_point_cloud(
+            img_tsp + "panorama_w_lines.pcd", panorama_pcd
+        )  # for debug
+        o3d.io.write_point_cloud(
+            img_tsp + "panorama_o_lines.pcd", lines_pcd
+        )  # for debug
 
         # 追加数据到JSON文件（不会覆盖之前的数据）
         with open("new.json", "w") as json_file:
@@ -361,6 +385,35 @@ class Pixel2PointCloud:
                 filtered_pts.append((point[0], point[1], point[2]))
         return filtered_pts
 
+    def apply_transformation(self, points, rotation_matrix, translation_vector):
+        """
+        对一组 3D 点进行旋转和平移变换。
+
+        参数:
+        points: 需要变换的 3D 点列表，每个点是一个 (x, y, z) 坐标。
+        rotation_matrix: 3x3 旋转矩阵 (NumPy 数组)。
+        translation_vector: 3x1 平移向量 (NumPy 数组)。
+
+        返回:
+        变换后的 3D 点列表。
+        """
+        transformed_points = []
+
+        for point in points:
+            # 将点转换为 NumPy 数组
+            point_array = np.array(point)
+
+            # 进行旋转: R * point
+            rotated_point = np.dot(rotation_matrix, point_array)
+
+            # 进行平移: R * point + translation
+            transformed_point = rotated_point + translation_vector
+
+            # 将变换后的点添加到列表中
+            transformed_points.append(transformed_point.tolist())
+
+        return transformed_points
+
     def generate_dot_lines(self, start_end_points, interval=0.01):
         """
         在至少两点 start_end_points 之间生成等间隔的三维点。
@@ -375,7 +428,7 @@ class Pixel2PointCloud:
         dot_lines = []
 
         for i in range(1, len(start_end_points)):
-            print(f"from\t{start_end_points[i-1]}\nto\t{start_end_points[i]}")
+            # print(f"from\t{start_end_points[i-1]}\nto\t{start_end_points[i]}")
             # 将点转换为 numpy 数组
             p1 = np.array(start_end_points[i - 1])
             p2 = np.array(start_end_points[i])
