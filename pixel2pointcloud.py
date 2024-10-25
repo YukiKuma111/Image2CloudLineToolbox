@@ -10,6 +10,9 @@ from scipy.spatial.transform import Rotation as R
 
 from geometry_msgs.msg import TransformStamped
 
+# 开启时保存过程中的点云文件
+DEBUG = True
+
 
 class Pixel2PointCloud:
     def __init__(self):
@@ -93,9 +96,6 @@ class Pixel2PointCloud:
         self.get_parameters()
         rvec, _ = cv2.Rodrigues(self.R_mat)
 
-        # 获取并排序文件夹中的 PCD 文件
-        # self.pcd_filelist = self.get_sorted_pcd()
-
         for img_tsp, data in pixel_data.items():
             # 定义并初始化变量
             roi_pcd = o3d.geometry.PointCloud()
@@ -116,13 +116,43 @@ class Pixel2PointCloud:
             rotation_matrix = tf_data[tf_tsp]["rotation_matrix"]
             inv_rotation_matrix = np.linalg.inv(rotation_matrix)
 
-            # 计算欧拉角（需要yaw对后续找到的地面点做筛查？）
-            # r = R.from_matrix(rotation_matrix)
-            # euler_angles = r.as_euler("xyz", degrees=True)
-            # print("euler_angles: ", euler_angles)
+            # True：不做坐标系的转换； False：是正常的流程（世界->body->世界）
+            flag = False
+            if flag:
+                translation = [0, 0, 0]
+                rotation_matrix = np.eye(3)
+                inv_rotation_matrix = np.linalg.inv(rotation_matrix)
+
+            # 定义四边形的四个顶点来围城ROI（只定义x和y轴）
+            w_a = [5, -5, 0]  # 左上
+            w_b = [5, 5, 0]  # 右上
+            w_c = [-5, 5, 0]  # 右下
+            w_d = [5, -5, 0]  # 左下
+            # 世界坐标系 -> body 坐标系转换
+            b_a = (
+                rotation_matrix @ np.array(w_a).reshape(3, 1)
+                + np.array(translation).reshape(3, 1)
+            ).flatten()
+            b_b = (
+                rotation_matrix @ np.array(w_b).reshape(3, 1)
+                + np.array(translation).reshape(3, 1)
+            ).flatten()
+            b_c = (
+                rotation_matrix @ np.array(w_c).reshape(3, 1)
+                + np.array(translation).reshape(3, 1)
+            ).flatten()
+            b_d = (
+                rotation_matrix @ np.array(w_d).reshape(3, 1)
+                + np.array(translation).reshape(3, 1)
+            ).flatten()
 
             # 裁剪全景点云，减少计算量
-            roi_points = self.filter_point_cloud(
+            # body坐标系下四边形过滤ROI
+            # roi_points = self.sq_filter_point_cloud(
+            #     panorama_pcd, b_a, b_b, b_c, b_d,
+            # )
+            # 通过xyz大小选出ROI
+            roi_points = self.mm_filter_point_cloud(
                 panorama_pcd,
                 translation[0] - 10,
                 translation[0] + 10,
@@ -134,21 +164,31 @@ class Pixel2PointCloud:
 
             # 将 roi_points 转换为 open3d.geometry.PointCloud 对象
             roi_pcd.points = o3d.utility.Vector3dVector(np.array(roi_points))
-            # o3d.io.write_point_cloud(img_tsp + "cliped.pcd", roi_pcd)  # for debug
+            if DEBUG:
+                o3d.io.write_point_cloud(
+                    self.save_path + img_tsp + "cliped.pcd", roi_pcd
+                )  # for debug
 
             # 对点云进行旋转和平移操作
             points = np.asarray(roi_pcd.points)
             transformed_points = points - translation  # 平移
             rotated_points = np.dot(transformed_points, inv_rotation_matrix.T)  # 旋转
             projection_pcd.points = o3d.utility.Vector3dVector(rotated_points)
-            # o3d.io.write_point_cloud(
-            #     img_tsp + "transformed_point_cloud.pcd", projection_pcd
-            # )  # for debug
+            if DEBUG:
+                o3d.io.write_point_cloud(
+                    self.save_path + img_tsp + "transformed_point_cloud.pcd",
+                    projection_pcd,
+                )  # for debug
 
             # 筛选投影点云（一般来说要配合相机FOV，这里先直接hardcode）
-            filtered_pts = self.filter_point_cloud(
-                projection_pcd, -1, 10, -2, 2, -10, -0.4
-            )
+            if not flag:
+                filtered_pts = self.mm_filter_point_cloud(
+                    projection_pcd, -0.1, 10, -2, 2, -10, 10
+                )
+            else:
+                filtered_pts = self.mm_filter_point_cloud(
+                    projection_pcd, -1, 10, -10, 10, -10, 10
+                )
 
             # 投影3D点到2D图像视图
             projected_pts, _ = cv2.projectPoints(
@@ -208,12 +248,13 @@ class Pixel2PointCloud:
             lines_pcd.points.extend(lines_panorama_pcd.points)
 
         # 保存点云结果
-        o3d.io.write_point_cloud(
-            img_tsp + "panorama_w_lines.pcd", panorama_pcd
-        )  # for debug
-        o3d.io.write_point_cloud(
-            img_tsp + "panorama_o_lines.pcd", lines_pcd
-        )  # for debug
+        if DEBUG:
+            o3d.io.write_point_cloud(
+                self.save_path + img_tsp + "panorama_w_lines.pcd", panorama_pcd
+            )  # for debug
+            o3d.io.write_point_cloud(
+                self.save_path + img_tsp + "panorama_o_lines.pcd", lines_pcd
+            )  # for debug
 
         # 追加数据到JSON文件（不会覆盖之前的数据）
         with open("new.json", "w") as json_file:
@@ -374,7 +415,8 @@ class Pixel2PointCloud:
         # 返回最近2D点对应的3D点云坐标
         return projection_dict[nearest_2d]
 
-    def filter_point_cloud(self, input_pcd, xmin, xmax, ymin, ymax, zmin, zmax):
+    # 直接通过比较xyz大小来筛选ROI内的点云
+    def mm_filter_point_cloud(self, input_pcd, xmin, xmax, ymin, ymax, zmin, zmax):
         filtered_pts = []
         for point in np.asarray(input_pcd.points):
             if (
@@ -382,6 +424,42 @@ class Pixel2PointCloud:
                 and ymin < point[1] < ymax
                 and zmin < point[2] < zmax
             ):
+                filtered_pts.append((point[0], point[1], point[2]))
+        return filtered_pts
+
+    def point_line_relation(self, point, lp1, lp2):
+        below_right_flag = None
+        x1, y1 = lp1[0], lp1[1]
+        x2, y2 = lp2[0], lp2[1]
+        px, py = point[0], point[1]
+        # line: y = kx + b
+        if (x2 - x1) != 0:
+            k = (y2 - y1) / (x2 - x1)
+            b = y1 - x1 * k
+            l_py = k * px + b
+            # 点在线的下或右，返回True，否则返回False
+            if l_py >= py:
+                below_right_flag = True
+            else:
+                below_right_flag = False
+        # line 平行于 y 轴
+        else:
+            if px >= x1:
+                below_right_flag = True
+            else:
+                below_right_flag = False
+
+        return below_right_flag
+
+    # 通过不规则四边形来筛选ROI内的点云
+    def sq_filter_point_cloud(self, input_pcd, a, b, c, d):
+        filtered_pts = []
+        for point in np.asarray(input_pcd.points):
+            below_ab = self.point_line_relation(point, a, b)
+            left_bc = self.point_line_relation(point, b, c)
+            above_cd = self.point_line_relation(point, c, d)
+            right_da = self.point_line_relation(point, d, a)
+            if (below_ab) and (not left_bc) and (not above_cd) and (right_da):
                 filtered_pts.append((point[0], point[1], point[2]))
         return filtered_pts
 
