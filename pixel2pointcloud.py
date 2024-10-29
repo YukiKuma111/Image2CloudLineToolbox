@@ -6,12 +6,12 @@ import open3d as o3d
 import os
 import rosbag
 import tf
-from scipy.spatial.transform import Rotation as R
 
-from geometry_msgs.msg import TransformStamped
+from scipy.spatial.transform import Rotation as R
+from scipy.spatial import KDTree
 
 # 开启时保存过程中的点云文件
-DEBUG = True
+DEBUG = False
 
 
 class Pixel2PointCloud:
@@ -123,35 +123,7 @@ class Pixel2PointCloud:
                 rotation_matrix = np.eye(3)
                 inv_rotation_matrix = np.linalg.inv(rotation_matrix)
 
-            # 定义四边形的四个顶点来围城ROI（只定义x和y轴）
-            w_a = [5, -5, 0]  # 左上
-            w_b = [5, 5, 0]  # 右上
-            w_c = [-5, 5, 0]  # 右下
-            w_d = [5, -5, 0]  # 左下
-            # 世界坐标系 -> body 坐标系转换
-            b_a = (
-                rotation_matrix @ np.array(w_a).reshape(3, 1)
-                + np.array(translation).reshape(3, 1)
-            ).flatten()
-            b_b = (
-                rotation_matrix @ np.array(w_b).reshape(3, 1)
-                + np.array(translation).reshape(3, 1)
-            ).flatten()
-            b_c = (
-                rotation_matrix @ np.array(w_c).reshape(3, 1)
-                + np.array(translation).reshape(3, 1)
-            ).flatten()
-            b_d = (
-                rotation_matrix @ np.array(w_d).reshape(3, 1)
-                + np.array(translation).reshape(3, 1)
-            ).flatten()
-
             # 裁剪全景点云，减少计算量
-            # body坐标系下四边形过滤ROI
-            # roi_points = self.sq_filter_point_cloud(
-            #     panorama_pcd, b_a, b_b, b_c, b_d,
-            # )
-            # 通过xyz大小选出ROI
             roi_points = self.mm_filter_point_cloud(
                 panorama_pcd,
                 translation[0] - 10,
@@ -204,6 +176,9 @@ class Pixel2PointCloud:
                 point_2d = tuple(projected_pts[i][0])  # 投影后的2D坐标
                 projection_dict[point_2d] = point_3d
 
+            # 构建 KDTree，方便后续查找
+            self.build_kdtree_for_projection(projection_dict)
+
             # 打印对应的线段数据并保存最近的3D点
             for i, line in enumerate(data["lines"], 1):
                 line_3d_points = []
@@ -211,9 +186,8 @@ class Pixel2PointCloud:
                 # 遍历每一个像素点，并通过计算距离其最近的2D投影点来查询到对应的3D点云坐标
                 for pxl in line:
                     print(f"  pixel {i}: {pxl}")
-                    nearest_3d_point = self.find_nearest_2d_point(
-                        [pxl[0], pxl[1]], projection_dict
-                    )
+                    # 查找最近邻点
+                    nearest_3d_point = self.find_nearest_2d_point([pxl[0], pxl[1]])
                     print(
                         f"  Nearest 3D point: [{nearest_3d_point[0]:.2f}, {nearest_3d_point[1]:.2f}, {nearest_3d_point[2]:.2f}]"
                     )
@@ -248,16 +222,15 @@ class Pixel2PointCloud:
             lines_pcd.points.extend(lines_panorama_pcd.points)
 
         # 保存点云结果
-        if DEBUG:
-            o3d.io.write_point_cloud(
-                self.save_path + img_tsp + "panorama_w_lines.pcd", panorama_pcd
-            )  # for debug
-            o3d.io.write_point_cloud(
-                self.save_path + img_tsp + "panorama_o_lines.pcd", lines_pcd
-            )  # for debug
+        o3d.io.write_point_cloud(
+            self.save_path + img_tsp + "panorama_w_lines.pcd", panorama_pcd
+        )
+        o3d.io.write_point_cloud(
+            self.save_path + img_tsp + "panorama_o_lines.pcd", lines_pcd
+        )
 
         # 追加数据到JSON文件（不会覆盖之前的数据）
-        with open("new.json", "w") as json_file:
+        with open(self.save_path + "point_pixel_map.json", "w") as json_file:
             json.dump(pixel_data, json_file, indent=4)
 
     def load_json_data(self):
@@ -288,32 +261,6 @@ class Pixel2PointCloud:
             }
 
         return result
-
-    def get_sorted_pcd(self):
-        # 获取所有PNG文件
-        pcd = [
-            os.path.join(self.pcd_folderpath, f)
-            for f in os.listdir(self.pcd_folderpath)
-            if f.endswith(".pcd")
-        ]
-        # 按文件名的前缀部分进行排序
-        pcd.sort(
-            key=lambda f: float(
-                os.path.basename(f).split(".")[0]
-                + "."
-                + os.path.basename(f).split(".")[1]
-            )
-        )
-        return pcd
-
-    def get_timestamp(self, filepath):
-        # 获取文件名作为时间戳，去掉文件扩展名
-        timestamp = (
-            os.path.basename(filepath).split(".")[0]
-            + "."
-            + os.path.basename(filepath).split(".")[1]
-        )
-        return timestamp
 
     def closest_tsp(self, target_tsp, tsp_list):
         crr_error = 0
@@ -401,67 +348,27 @@ class Pixel2PointCloud:
 
         return tf_dict
 
-    # 通过2D像素点查找对应的3D点云坐标
-    def find_nearest_2d_point(self, target_2d, projection_dict):
-        # 计算字典中所有2D点与目标点的距离
-        distances = {
-            pt_2d: np.linalg.norm(np.array(pt_2d) - np.array(target_2d))
-            for pt_2d in projection_dict.keys()
-        }
+    # 通过 2D 像素点查找对应的 3D 点云坐标
+    def find_nearest_2d_point(self, target_2d):
+        # 在 KDTree 中查找最近的 2D 点
+        _, idx = self.kd_tree.query(target_2d)
+        nearest_2d = list(self.projection_dict.keys())[idx]
 
-        # 找到最近的2D点
-        nearest_2d = min(distances, key=distances.get)
+        # 返回最近的 2D 点对应的 3D 点云坐标
+        return self.projection_dict[nearest_2d]
 
-        # 返回最近2D点对应的3D点云坐标
-        return projection_dict[nearest_2d]
-
-    # 直接通过比较xyz大小来筛选ROI内的点云
+    # 通过 octree 筛选 ROI 内的点云
     def mm_filter_point_cloud(self, input_pcd, xmin, xmax, ymin, ymax, zmin, zmax):
-        filtered_pts = []
-        for point in np.asarray(input_pcd.points):
-            if (
-                xmin < point[0] < xmax
-                and ymin < point[1] < ymax
-                and zmin < point[2] < zmax
-            ):
-                filtered_pts.append((point[0], point[1], point[2]))
-        return filtered_pts
+        # 创建 Axis-Aligned Bounding Box (AABB)
+        bounding_box = o3d.geometry.AxisAlignedBoundingBox(
+            min_bound=(xmin, ymin, zmin), max_bound=(xmax, ymax, zmax)
+        )
 
-    def point_line_relation(self, point, lp1, lp2):
-        below_right_flag = None
-        x1, y1 = lp1[0], lp1[1]
-        x2, y2 = lp2[0], lp2[1]
-        px, py = point[0], point[1]
-        # line: y = kx + b
-        if (x2 - x1) != 0:
-            k = (y2 - y1) / (x2 - x1)
-            b = y1 - x1 * k
-            l_py = k * px + b
-            # 点在线的下或右，返回True，否则返回False
-            if l_py >= py:
-                below_right_flag = True
-            else:
-                below_right_flag = False
-        # line 平行于 y 轴
-        else:
-            if px >= x1:
-                below_right_flag = True
-            else:
-                below_right_flag = False
+        # 通过 AABB 在点云上直接过滤出符合条件的点
+        filtered_pcd = input_pcd.crop(bounding_box)
+        filtered_pts = np.asarray(filtered_pcd.points)
 
-        return below_right_flag
-
-    # 通过不规则四边形来筛选ROI内的点云
-    def sq_filter_point_cloud(self, input_pcd, a, b, c, d):
-        filtered_pts = []
-        for point in np.asarray(input_pcd.points):
-            below_ab = self.point_line_relation(point, a, b)
-            left_bc = self.point_line_relation(point, b, c)
-            above_cd = self.point_line_relation(point, c, d)
-            right_da = self.point_line_relation(point, d, a)
-            if (below_ab) and (not left_bc) and (not above_cd) and (right_da):
-                filtered_pts.append((point[0], point[1], point[2]))
-        return filtered_pts
+        return filtered_pts.tolist()
 
     def apply_transformation(self, points, rotation_matrix, translation_vector):
         """
@@ -525,6 +432,101 @@ class Pixel2PointCloud:
             dot_lines.append(points)
 
         return dot_lines
+
+    # 初始化 KDTree
+    def build_kdtree_for_projection(self, projection_dict):
+        # 将 projection_dict 中的 2D 点作为数组，并构建 KDTree
+        self.kd_tree = KDTree(list(projection_dict.keys()))
+        self.projection_dict = projection_dict
+
+    # 未被使用的函数 #
+    def get_sorted_pcd(self):
+        # 获取所有PNG文件
+        pcd = [
+            os.path.join(self.pcd_folderpath, f)
+            for f in os.listdir(self.pcd_folderpath)
+            if f.endswith(".pcd")
+        ]
+        # 按文件名的前缀部分进行排序
+        pcd.sort(
+            key=lambda f: float(
+                os.path.basename(f).split(".")[0]
+                + "."
+                + os.path.basename(f).split(".")[1]
+            )
+        )
+        return pcd
+
+    def get_timestamp(self, filepath):
+        # 获取文件名作为时间戳，去掉文件扩展名
+        timestamp = (
+            os.path.basename(filepath).split(".")[0]
+            + "."
+            + os.path.basename(filepath).split(".")[1]
+        )
+        return timestamp
+
+    # 通过不规则四边形来筛选ROI内的点云
+    def sq_filter_point_cloud(self, input_pcd, a, b, c, d):
+        filtered_pts = []
+        for point in np.asarray(input_pcd.points):
+            below_ab = self.point_line_relation(point, a, b)
+            left_bc = self.point_line_relation(point, b, c)
+            above_cd = self.point_line_relation(point, c, d)
+            right_da = self.point_line_relation(point, d, a)
+            if (below_ab) and (not left_bc) and (not above_cd) and (right_da):
+                filtered_pts.append((point[0], point[1], point[2]))
+        return filtered_pts
+
+    def point_line_relation(self, point, lp1, lp2):
+        below_right_flag = None
+        x1, y1 = lp1[0], lp1[1]
+        x2, y2 = lp2[0], lp2[1]
+        px, py = point[0], point[1]
+        # line: y = kx + b
+        if (x2 - x1) != 0:
+            k = (y2 - y1) / (x2 - x1)
+            b = y1 - x1 * k
+            l_py = k * px + b
+            # 点在线的下或右，返回True，否则返回False
+            if l_py >= py:
+                below_right_flag = True
+            else:
+                below_right_flag = False
+        # line 平行于 y 轴
+        else:
+            if px >= x1:
+                below_right_flag = True
+            else:
+                below_right_flag = False
+
+        return below_right_flag
+
+    # 直接通过比较xyz大小来筛选ROI内的点云
+    def old_mm_filter_point_cloud(self, input_pcd, xmin, xmax, ymin, ymax, zmin, zmax):
+        filtered_pts = []
+        for point in np.asarray(input_pcd.points):
+            if (
+                xmin < point[0] < xmax
+                and ymin < point[1] < ymax
+                and zmin < point[2] < zmax
+            ):
+                filtered_pts.append((point[0], point[1], point[2]))
+        return filtered_pts
+
+    # 通过2D像素点查找对应的3D点云坐标
+    def old_find_nearest_2d_point(self, target_2d, projection_dict):
+        # 计算字典中所有2D点与目标点的距离
+        distances = {
+            pt_2d: np.linalg.norm(np.array(pt_2d) - np.array(target_2d))
+            for pt_2d in projection_dict.keys()
+        }
+
+        # 找到最近的2D点
+        nearest_2d = min(distances, key=distances.get)
+
+        # 返回最近2D点对应的3D点云坐标
+        return projection_dict[nearest_2d]
 
 
 if __name__ == "__main__":
