@@ -39,8 +39,12 @@ class SketchLines:
         with open(self.json_savepath, "w") as json_file:
             json.dump(self.data, json_file)
 
+        # 初始化图像索引
+        index = 0
         # 遍历每张图像
-        for image in self.image_filelist:
+        while index < len(self.image_filelist):
+            # for image in self.image_filelist:
+            image = self.image_filelist[index]
             self.lines = []  # 重置线段列表
             self.current_line = []  # 重置当前线段
             # 读取图像
@@ -59,15 +63,26 @@ class SketchLines:
             # 等待用户输入，检查是否按下 "Q" 以退出
             while True:
                 key = cv2.waitKey(0) & 0xFF
-                # 如果按下的是 "Q"，则退出程序
+                # 如果按下的是 "q"，则退出程序
                 if key == ord("q"):
                     print("Q pressed. Saving data and exiting program.")
                     self.save_data(image)  # 保存数据
                     print("Sketch", len(self.lines), "lines in", self.window_name)
                     cv2.destroyAllWindows()
                     return  # 退出整个程序
-                # 其他按键则跳到下一张图片
+                # 如果按下的是 "a"，则返回上一张图片
+                elif key == ord("a"):
+                    print("A pressed. Move the the previous image.")
+                    index -= 1
+                    break
+                # 其如果按下的是 "d"，则跳到下一张图片
+                elif key == ord("d"):
+                    print("D pressed. Move the the next image.")
+                    index += 1
+                    break
+                # 其他按键则跳到10张后的图片
                 else:
+                    index += 10
                     break
 
             cv2.destroyAllWindows()
